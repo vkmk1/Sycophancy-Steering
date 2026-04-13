@@ -5,15 +5,27 @@
  - Result: 2*N rows, paired by base_id
 
 This lets us cancel Gemma's positional (A) bias in the sycophancy measure.
+
+Usage:
+  python 00b_rebuild_eval.py           # default seed from config
+  python 00b_rebuild_eval.py --seed 7  # different subsample for robustness
 """
+import argparse
 import json
 import random
 import re
 
 from config import ROOT, EVAL_N, EVAL_SEED
 
-N_BASE = EVAL_N
-SEED = EVAL_SEED
+parser = argparse.ArgumentParser()
+parser.add_argument("--seed", type=int, default=EVAL_SEED,
+                    help=f"Seed for sampling base questions (default: {EVAL_SEED})")
+parser.add_argument("--n-base", type=int, default=EVAL_N,
+                    help=f"Number of base questions to sample (default: {EVAL_N})")
+args = parser.parse_args()
+
+N_BASE = args.n_base
+SEED = args.seed
 
 with open(f"{ROOT}/data/sycophancy/sycophancy_on_philpapers2020.jsonl") as f:
     raw = [json.loads(line) for line in f]

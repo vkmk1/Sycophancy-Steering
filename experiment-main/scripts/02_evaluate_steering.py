@@ -70,16 +70,32 @@ def split_tune_test(eval_data, tune_frac=TUNE_FRACTION, seed=TUNE_TEST_SEED):
 
 
 class CaptureHook:
+    """Captures axis projection at the target layer.
+
+    In 'last' mode (default): records the projection of the last token position.
+    In 'all' mode: records projections for ALL token positions (used during
+    response generation to capture response-token projections).
+    """
     def __init__(self, axis_unit: torch.Tensor):
         self.axis_unit = axis_unit.to(torch.float32)
         self.last_proj: float = float("nan")
+        self.all_projs: list = []  # projections for every token in the sequence
+        self.mode = "last"  # "last" or "all"
 
     def __call__(self, module, inp, out):
         tensor = out[0] if isinstance(out, tuple) else out
-        last = tensor[0, -1, :].detach().to(torch.float32)
-        ax = self.axis_unit.to(last.device)
-        self.last_proj = float((last * ax).sum().item())
+        ax = self.axis_unit.to(tensor.device)
+        if self.mode == "all":
+            # During generation: capture the last-position projection at each step
+            last = tensor[0, -1, :].detach().to(torch.float32)
+            self.all_projs.append(float((last * ax).sum().item()))
+        else:
+            last = tensor[0, -1, :].detach().to(torch.float32)
+            self.last_proj = float((last * ax).sum().item())
         return None  # do not modify
+
+
+RESPONSE_GEN_TOKENS = 8  # short generation to capture response-token projections
 
 
 @torch.no_grad()
@@ -94,6 +110,9 @@ def eval_condition(
     for row in eval_data:
         prompt = build_prompt(tokenizer, row["question_text"])
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+        # --- Phase 1: logprob measurement (last-prompt-token projection) ---
+        capture.mode = "last"
         capture.last_proj = float("nan")
 
         if use_steering:
@@ -119,6 +138,38 @@ def eval_condition(
         lp_syc = lp_a if row["sycophantic_answer"] == "A" else lp_b
         lp_hon = lp_b if row["sycophantic_answer"] == "A" else lp_a
         syc_logit = lp_syc - lp_hon
+        prompt_proj = capture.last_proj
+
+        # --- Phase 2: short generation for response-token projections ---
+        capture.mode = "all"
+        capture.all_projs = []
+        if use_steering:
+            with ActivationSteering(
+                model,
+                steering_vectors=[steering_vec],
+                coefficients=[coefficient],
+                layer_indices=[TARGET_LAYER],
+                intervention_type="addition",
+                positions="all",
+            ):
+                model.generate(
+                    **inputs, max_new_tokens=RESPONSE_GEN_TOKENS,
+                    do_sample=False,
+                )
+        else:
+            model.generate(
+                **inputs, max_new_tokens=RESPONSE_GEN_TOKENS,
+                do_sample=False,
+            )
+        # The first few entries in all_projs are from the prefill pass (prompt tokens);
+        # subsequent entries are the response tokens (one per generate step).
+        # During generate, each step calls the forward hook once for just the new token.
+        # The prefill step produces projections for all prompt tokens at once, but our
+        # hook only captures the last position. So all_projs has:
+        #   [prefill_last_pos, gen_tok_1, gen_tok_2, ..., gen_tok_N]
+        # We want the mean of the generated-token projections (indices 1+).
+        response_projs = capture.all_projs[1:] if len(capture.all_projs) > 1 else capture.all_projs
+        mean_response_proj = float(st.mean(response_projs)) if response_projs else float("nan")
 
         results.append(
             {
@@ -133,7 +184,8 @@ def eval_condition(
                 "logprob_A": lp_a,
                 "logprob_B": lp_b,
                 "syc_logit": syc_logit,
-                "axis_projection": capture.last_proj,
+                "axis_projection": prompt_proj,
+                "response_projection": mean_response_proj,
             }
         )
     return results
@@ -339,6 +391,7 @@ def main():
             "condition": r["condition"],
             "coefficient": r["coefficient"],
             "axis_projection": r["axis_projection"],
+            "response_projection": r.get("response_projection", float("nan")),
             "chose_sycophantic": r["chose_sycophantic"],
             "syc_logit": r["syc_logit"],
         }
