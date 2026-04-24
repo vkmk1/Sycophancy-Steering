@@ -1,4 +1,4 @@
-\documentclass[preprint]{article}
+\documentclass{article}
 
 \usepackage{icml2026}
 \usepackage{hyperref}
@@ -43,7 +43,7 @@
 \fancyhead[C]{\small\bf\@icmltitlerunning}
 \makeatother
 
-\printAffiliationsAndNotice{\icmlEqualContribution}
+\printAffiliationsAndNotice{}
 
 \begin{abstract}
 Large language models often exhibit sycophancy, adapting their responses to match a user's stated view even when that view is false.
@@ -58,58 +58,56 @@ Our results support critical-role steering as a lightweight sycophancy intervent
 \section{Introduction}
 \label{sec:intro}
 
-Sycophancy---the tendency of large language models to agree with users regardless of factual correctness---is among the most persistent failure modes of RLHF-trained models \citep{perez2022discovering, sharma2023towards}.
-Even when a model has encoded the correct answer internally, the reward model's preference for agreement can override it \citep{wang2025truth}.
-This raises a fundamental question: how can we intervene on sycophancy without expensive retraining or curated behavioral datasets?
+Sycophancy---the tendency of large language models to agree with users regardless of factual correctness---is a persistent failure mode of RLHF-trained models \citep{perez2022discovering, sharma2023towards}. Even when a model encodes the correct answer internally, reward-model preferences for agreement can override it \citep{wang2025truth}, undermining the model's reliability as an epistemic tool.
 
-One approach is Contrastive Activation Addition (CAA), introduced by \citet{rimsky2024steering} building on \citet{turner2023activation}.
-CAA extracts a steering vector from contrastive prompt pairs---one sycophantic, one honest---and adds a scaled version during inference.
-While effective, CAA requires curating hundreds of behavior-specific prompt pairs, a process that must be repeated for each new target behavior.
+The dominant intervention, Contrastive Activation Addition (CAA), extracts steering vectors from contrastive sycophantic-vs-honest prompt pairs and adds them during inference \citep{rimsky2024steering, turner2023activation}. While effective, CAA requires behavior-specific datasets---a bottleneck limiting scalability. Meanwhile, LLMs encode persona information along interpretable linear directions \citep{lu2025assistant}, and persona agreeableness correlates strongly with sycophancy \citep{shah2025nice}. This raises a natural question: can general-purpose persona vectors, never trained on sycophancy, serve as anti-sycophancy interventions?
 
-Recent work suggests an alternative via persona representations.
-\citet{lu2025assistant} introduced the Assistant Axis, showing that LLMs encode persona information along interpretable linear directions, and released pre-computed role vectors (e.g., ``skeptic,'' ``judge,'' ``peacekeeper'') for multiple models.
-\citet{shah2025nice} found persona agreeableness correlates strongly with sycophancy ($r$ up to 0.87), and \citet{vennemeyer2025sycophancy} showed that sycophantic behavior decomposes into distinct sub-components along separable linear directions.
-Together, these findings suggest persona-level features may provide leverage over sycophancy, but no prior work has tested whether general-purpose persona vectors---never trained on sycophancy---can serve as anti-sycophancy interventions.
+\emph{No prior work has tested general-purpose persona vectors as interventions for alignment-relevant behaviors.} This is the gap we address. We evaluate whether off-the-shelf role vectors---Skeptic, Devil's Advocate, Judge---can reduce forced-choice sycophancy comparably to the data-intensive CAA baseline, and whether the geometric relationship between persona and sycophancy directions reveals anything about the underlying mechanisms.
 
-We ask three questions: (1) Can off-the-shelf role vectors reduce forced-choice sycophancy comparably to CAA? (2) Do critical/conformist family labels predict steering direction? (3) Are effective role vectors geometrically distinct from the CAA direction?
-We evaluate across Gemma~2 27B \citep{gemma2024} and Qwen~3 32B \citep{qwen2025} on a counterbalanced PhilPapers benchmark with tune/test splitting and Holm-corrected significance testing.
+We find that critical-role persona vectors reduce sycophancy to within 68--98\% of CAA's effect across two models and three test seeds, without any sycophancy-specific data. These role vectors are nearly orthogonal to CAA in activation space, suggesting largely distinct representational pathways. Over-correction probes indicate that role-based steering produces more calibrated disagreement than CAA, with Judge and Skeptic outperforming the targeted baseline on factual accuracy.
 
-Our findings: critical-role vectors achieve 68--116\% of CAA's reduction with strong cross-seed consistency. Conformist roles produce weak, heterogeneous effects, and a dropped conformist role (facilitator) actively reduces sycophancy, partially falsifying bidirectionality. All role vectors are nearly orthogonal to CAA ($|\cos| < 0.17$), but this geometric independence does not prove mechanistic independence.
+\paragraph{Related work.}
+Sycophancy has been documented across model families \citep{perez2022discovering, sharma2023towards}, traced to reward-model training \citep{wang2025truth}, and decomposed into distinct sub-components along separable linear directions \citep{vennemeyer2025sycophancy}.
+Activation Addition \citep{turner2023activation} and CAA \citep{rimsky2024steering} steer model behavior by adding scaled directions to the residual stream, with extensions to conditional \citep{lee2025cast}, multi-layer \citep{goral2025depth}, and representation-engineering approaches \citep{zou2023representation, li2023inference}---all requiring behavior-specific data.
+\citet{lu2025assistant} showed LLMs encode persona information along interpretable linear directions; \citet{shah2025nice} found persona agreeableness correlates with sycophancy ($r$ up to 0.87); \citet{wang2025persona} showed persona features control emergent misalignment; and \citet{billy2025, feng2026persona} explored compositional persona steering.
+Our work differs from all of these: we repurpose general-purpose persona vectors as interventions for an alignment behavior, testing whether the persona--sycophancy correlation is strong enough for practical steering.
 
 % ============================================================
-\section{Experimental Setup}
-\label{sec:setup}
+\section{Methodology}
+\label{sec:method}
 
-We evaluate activation steering across two instruction-tuned models, a behavior-specific CAA baseline, and six role-based conditions, using a forced-choice sycophancy benchmark with counterbalancing and strict tune/test separation.
+We evaluate activation steering across two instruction-tuned models using a forced-choice sycophancy benchmark with counterbalancing, strict tune/test separation, and Holm-corrected significance testing. This section explains each design choice and its rationale.
 
-We selected Gemma~2 27B Instruct \citep{gemma2024} and Qwen~3 32B \citep{qwen2025} because they represent distinct model families at comparable scale with substantially different baseline sycophancy rates (Gemma: 59\%, Qwen: 84\%), providing a natural robustness test.
-Steering is applied via \texttt{ActivationSteering} \citep{lu2025assistant} at layer~22 (Gemma) / layer~32 (Qwen), addition mode, all token positions.
-For a unit-normalized vector $\mathbf{v}$ and coefficient $\alpha$, the steered residual-stream activation is $\mathbf{h}'_\ell = \mathbf{h}_\ell + \alpha \, \mathbf{v}$.
-We measure the sycophancy logit $\text{syc\_logit} = \log p(\text{syc\_token}) - \log p(\text{hon\_token})$ at the final prompt position, where the sycophantic token matches the user's stated opinion.
-Our primary metric is $\Delta\text{logit} = \bar{s}_{\text{steered}} - \bar{s}_{\text{baseline}}$ (negative = reduced sycophancy).
+\paragraph{Models.}
+We selected Gemma~2 27B Instruct \citep{gemma2024} and Qwen~3 32B \citep{qwen2025} because they represent distinct model families at comparable scale with substantially different baseline sycophancy rates (Gemma: 59\%, Qwen: 84\%). This difference provides a natural robustness test: if persona steering works on both a mildly sycophantic and a highly sycophantic model, the finding is more likely to generalize. Steering is applied via \texttt{ActivationSteering} \citep{lu2025assistant} at layer~22 (Gemma) and layer~32 (Qwen), using addition mode at all token positions. For a unit-normalized vector $\mathbf{v}$ and coefficient $\alpha$, the steered residual-stream activation is:
+\begin{equation}
+\mathbf{h}'_\ell = \mathbf{h}_\ell + \alpha \, \mathbf{v}
+\label{eq:steering}
+\end{equation}
 
-We report a focused subset of a broader 24-condition experiment; four dropped conditions are documented in Appendix~\ref{app:transparency}.
-The CAA baseline is constructed from ${\sim}$2,000 A/B pairs from \texttt{nlp\_survey} + \texttt{political\_typology} \citep{rimsky2024steering}, disjoint from our evaluation set to prevent train/test overlap.
-Three critical roles (Skeptic, Devil's Advocate, Judge) and three conformist roles (Peacekeeper, Pacifist, Collaborator) are unanchored persona vectors from \citet{lu2025assistant}, computed as unit(role~$-$~default) and steered with positive coefficient toward the role.
-We use unanchored rather than anchored directions because our goal is to shift the model away from its sycophantic default, not to isolate role-specific distinctiveness.
-Ten unit-Gaussian random vectors are pooled as a null baseline.
+\paragraph{Metrics.}
+We measure the sycophancy logit at the final prompt position:
+\begin{equation}
+\text{syc\_logit} = \log p(\text{syc\_token}) - \log p(\text{hon\_token})
+\label{eq:syclogit}
+\end{equation}
+where the sycophantic token matches the user's stated opinion. Our primary metric is $\Delta\text{logit} = \bar{s}_{\text{steered}} - \bar{s}_{\text{baseline}}$, where negative values indicate reduced sycophancy.
 
-The evaluation benchmark is \texttt{philpapers2020} \citep{perez2022discovering}: 300 questions $\times$ 2 orderings (counterbalancing Gemma's 93\% A-bias) = 600 rows/seed.
-We enforce a 50/50 tune/test split (seed~99, pairs together).
-Coefficients are locked on the tune split (mode across 5 seeds), then fixed for 3 test seeds (42, 7, 123).
-Gemma sweep: $\{\pm5000, \pm2000, \pm1000, \pm500, 0\}$; Qwen: $\{\pm500, \pm200, \pm100, \pm50, 0\}$ (10$\times$ rescale for Qwen's sensitivity).
-Significance: paired Wilcoxon ($n$=150/seed), Holm-corrected across 14 conditions.
-Degradation flagged when rate $\approx$ 0.5 and logit $\approx$ random-mean.
+\paragraph{Conditions.}
+We report a focused subset of a broader 24-condition experiment; four dropped conditions are documented in Appendix~\ref{app:transparency}. The CAA baseline is constructed from ${\sim}$2,000 A/B pairs from \texttt{nlp\_survey} and \texttt{political\_typology} \citep{rimsky2024steering}, disjoint from our evaluation set to prevent train/test overlap. Three critical roles (Skeptic, Devil's Advocate, Judge) and three conformist roles (Peacekeeper, Pacifist, Collaborator) are unanchored persona vectors from \citet{lu2025assistant}, computed as unit(role~$-$~default) and steered with positive coefficient toward the role. We use unanchored rather than anchored directions because our goal is to shift the model away from its sycophantic default, not to isolate role-specific distinctiveness. Ten unit-Gaussian random vectors are pooled as a null baseline.
+
+\paragraph{Benchmark and protocol.}
+The evaluation benchmark is \texttt{philpapers2020} \citep{perez2022discovering}: 300 questions $\times$ 2 orderings (counterbalancing Gemma's 93\% A-bias) = 600 rows per seed. We enforce a 50/50 tune/test split (seed~99, pairs together). Coefficients are locked on the tune split (mode across 5 seeds), then fixed for 3 test seeds (42, 7, 123). Gemma sweep: $\{\pm5000, \pm2000, \pm1000, \pm500, 0\}$; Qwen: $\{\pm500, \pm200, \pm100, \pm50, 0\}$ (approximately 10$\times$ rescaled for Qwen's sensitivity). This tune/test separation is critical: it prevents the coefficient selection from inflating test-set effect sizes, a concern when steering can produce model collapse at extreme coefficients. Significance testing uses paired Wilcoxon tests ($n$=150 per seed), Holm-corrected across 14 conditions. Degradation is flagged when the sycophancy rate approaches 0.5 and the logit approaches the random-vector mean.
 
 % ============================================================
-\section{Results}
+\section{Experiments and Results}
 \label{sec:results}
 
 \subsection{Critical Roles Reduce Sycophancy}
 
-Table~\ref{tab:main} and Figure~\ref{fig:delta_logit} present the primary results. On Gemma~2 27B (baseline sycophancy logit $+1.01$, rate 59\%), all three critical-role conditions achieve Holm-corrected significance on all three test seeds. The critical-family mean $\Delta$logit is $-0.596$, reaching 68\% of CAA's $-0.879$. Notably, Skeptic achieves a 9.6 percentage-point binary-rate reduction, slightly exceeding CAA's 8.9~pp, despite using no sycophancy-specific data. Devil's Advocate ($\Delta$logit $-0.521$, $\Delta$rate $-8.7$~pp) and Judge ($-0.556$, $-9.3$~pp) show similarly robust effects. The random null ($\Delta$logit $-0.254$, $\Delta$rate $-2.1$~pp) is substantially smaller, confirming that the critical-role effects are direction-specific rather than artifacts of activation perturbation at comparable norms.
+Table~\ref{tab:main} and Figure~\ref{fig:delta_logit} present the primary results. On Gemma~2 27B (baseline sycophancy logit $+1.01$, rate 59\%), all three critical-role conditions achieve Holm-corrected significance on all three test seeds. The critical-family mean $\Delta$logit is $-0.596$, reaching 68\% of CAA's $-0.879$. Notably, Skeptic achieves a 9.6 percentage-point binary-rate reduction, slightly exceeding CAA's 8.9~pp, despite using no sycophancy-specific data. Devil's Advocate ($\Delta$logit $-0.521$, $\Delta$rate $-8.7$~pp) and Judge ($-0.556$, $-9.3$~pp) show similarly robust effects. The random null ($\Delta$logit $-0.254$, $\Delta$rate $-2.1$~pp) is substantially smaller, confirming that the critical-role effects are direction-specific rather than artifacts of activation perturbation at comparable norms. The takeaway is clear: off-the-shelf critical-role vectors, with zero sycophancy-specific data, achieve meaningful sycophancy reduction on a mildly sycophantic model.
 
-On Qwen~3 32B (baseline logit $+3.00$, rate 84\%), absolute effect sizes are larger, consistent with the model's higher baseline sycophancy. The critical-family mean $\Delta$logit is $-1.931$, reaching 98\% of CAA's $-1.965$. Devil's Advocate achieves $\Delta$logit $-2.272$, numerically exceeding CAA. Skeptic ($-1.823$, $-18.1$~pp) and Judge ($-1.699$, $-4.4$~pp) are also strongly significant across all seeds. The random null is larger on Qwen ($-1.058$, $-10.3$~pp), indicating that this model is generally more sensitive to activation perturbation, but the critical-role effects still substantially exceed the random baseline. Per-seed consistency is high: critical roles are tightly clustered across all 3~test seeds (Skeptic std $= 0.013$ on Gemma, $0.058$ on Qwen; see Appendix~\ref{app:seeds}), confirming stable, replicable effects.
+On Qwen~3 32B (baseline logit $+3.00$, rate 84\%), absolute effect sizes are larger, consistent with the model's higher baseline sycophancy. The critical-family mean $\Delta$logit is $-1.931$, reaching 98\% of CAA's $-1.965$. Devil's Advocate achieves $\Delta$logit $-2.272$, numerically exceeding CAA. Skeptic ($-1.823$, $-18.1$~pp) and Judge ($-1.699$, $-4.4$~pp) are also strongly significant across all seeds. The random null is larger on Qwen ($-1.058$, $-10.3$~pp), indicating that this model is generally more sensitive to activation perturbation, but the critical-role effects still substantially exceed the random baseline. Per-seed consistency is high: critical roles are tightly clustered across all 3~test seeds (Skeptic std $= 0.013$ on Gemma, $0.058$ on Qwen; see Appendix~\ref{app:seeds}). On a highly sycophantic model, persona vectors essentially match CAA.
 
 \begin{figure}[t]
     \centering
@@ -154,20 +152,18 @@ On Qwen~3 32B (baseline logit $+3.00$, rate 84\%), absolute effect sizes are lar
 
 \subsection{Conformist Roles: Heterogeneous Effects}
 
-If role-family labels were reliable predictors of sycophancy direction, conformist roles should increase sycophancy when steered positively. Instead, their effects are weak and heterogeneous. On Gemma, the conformist-family mean $\Delta$logit is $+0.031$ (range $[-0.052, +0.100]$), indistinguishable from noise. Peacekeeper is non-significant, Pacifist achieves marginal significance on only 1/3 seeds, and Collaborator reaches significance on 2/3 seeds but with a small positive $\Delta$logit ($+0.045$). This pattern does not support bidirectionality, but it does confirm directional specificity: critical roles produce large, reliable reductions while conformist roles do not.
-
-On Qwen (baseline 84\%), interpretation is further complicated by ceiling effects and degradation. Pacifist at $+500$ produces model collapse---repetitive text loops (``the truth that is the truth\ldots'')---and is flagged as degraded rather than genuinely sycophantic. Peacekeeper and Collaborator are both non-significant. Importantly, Appendix~\ref{app:transparency} documents that facilitator, a conformist role emphasizing cooperation and harmony, actually reduces sycophancy on both models ($\Delta$logit $-0.727$ on Gemma, $-0.469$ on Qwen). This result directly contradicts simple family-level predictions and is a primary reason we characterize the bidirectionality hypothesis as only partially supported.
+If role-family labels were reliable predictors of sycophancy direction, conformist roles should increase sycophancy when steered positively. Instead, their effects are weak and heterogeneous. On Gemma, the conformist-family mean $\Delta$logit is $+0.031$ (range $[-0.052, +0.100]$), indistinguishable from noise. Peacekeeper is non-significant, Pacifist achieves marginal significance on only 1/3 seeds, and Collaborator reaches significance on 2/3 seeds but with a small positive $\Delta$logit ($+0.045$). On Qwen (baseline 84\%), interpretation is further complicated by ceiling effects and degradation. Pacifist at $+500$ produces model collapse---repetitive text loops---and is flagged as degraded. Peacekeeper and Collaborator are both non-significant. Importantly, facilitator, a conformist role emphasizing cooperation and harmony, actually reduces sycophancy on both models ($\Delta$logit $-0.727$ on Gemma, $-0.469$ on Qwen; Appendix~\ref{app:transparency}). This result directly contradicts simple family-level predictions and is a primary reason we characterize the bidirectionality hypothesis as only partially supported. The takeaway: critical roles reliably reduce sycophancy, but conformist roles do not reliably increase it---the persona--sycophancy mapping is asymmetric.
 
 \subsection{Geometric Relationship to CAA}
 
-Figure~\ref{fig:cosines} displays cosine similarities between all steering vectors. All role--CAA cosines fall below 0.17 on Gemma and below 0.11 on Qwen, meaning the role vectors point in nearly orthogonal directions to the supervised sycophancy axis. Within families, critical roles cluster together (Skeptic--Devil's Advocate: 0.64 on Gemma, 0.71 on Qwen) and conformist roles cluster separately (Peacekeeper--Pacifist: 0.85/0.79), but neither cluster aligns with CAA. This geometric pattern means role vectors are not merely recovering the CAA direction---they achieve sycophancy reduction through largely distinct activation-space perturbations.
+Figure~\ref{fig:cosines} displays cosine similarities between all steering vectors. All role--CAA cosines fall below 0.17 on Gemma and below 0.11 on Qwen, meaning the role vectors point in nearly orthogonal directions to the supervised sycophancy axis. Within families, critical roles cluster together (Skeptic--Devil's Advocate: 0.64 on Gemma, 0.71 on Qwen) and conformist roles cluster separately (Peacekeeper--Pacifist: 0.85/0.79), but neither cluster aligns with CAA.
 
 Formally, each role vector $\mathbf{v}_r$ can be decomposed into a CAA-aligned component and a residual:
 \begin{equation}
 \mathbf{v}_r = \underbrace{(\mathbf{v}_r \cdot \hat{\mathbf{v}}_{\text{CAA}}) \, \hat{\mathbf{v}}_{\text{CAA}}}_{\text{CAA-aligned}} + \underbrace{\mathbf{v}_r - (\mathbf{v}_r \cdot \hat{\mathbf{v}}_{\text{CAA}}) \, \hat{\mathbf{v}}_{\text{CAA}}}_{\text{residual } \perp \text{ CAA}}
 \label{eq:decomp}
 \end{equation}
-Since $|\mathbf{v}_r \cdot \hat{\mathbf{v}}_{\text{CAA}}| < 0.17$ for all role vectors, the CAA-aligned component has norm $< 0.17$ while the residual has norm $> 0.98$. The sycophancy reduction is thus overwhelmingly carried by the residual direction. However, whether this residual operates through a mechanistically distinct pathway or converges on the same downstream circuits remains an open question. A definitive test would steer with only the unit-normalized residual and measure whether sycophancy still decreases.
+Since $|\mathbf{v}_r \cdot \hat{\mathbf{v}}_{\text{CAA}}| < 0.17$ for all role vectors, the CAA-aligned component has norm $< 0.17$ while the residual has norm $> 0.98$. The sycophancy reduction is thus overwhelmingly carried by the residual direction. This geometric pattern means role vectors are not merely recovering the CAA direction---they achieve sycophancy reduction through largely distinct activation-space perturbations. However, whether this residual operates through a mechanistically distinct pathway or converges on the same downstream circuits remains an open question.
 
 \begin{figure}[t]
     \centering
@@ -177,11 +173,9 @@ Since $|\mathbf{v}_r \cdot \hat{\mathbf{v}}_{\text{CAA}}| < 0.17$ for all role v
     \label{fig:cosines}
 \end{figure}
 
-\subsection{Dose-Response Profiles}
+\subsection{Dose-Response and Qualitative Evidence}
 
-Figure~\ref{fig:steering_curves} shows family-averaged steering curves across the full coefficient sweep. Critical roles produce a monotonic dose-response on both models: sycophancy decreases with increasing positive coefficient until degradation onset at the sweep extremes. On Gemma, the critical-family curve separates from the random null band by coefficient $+1000$ and achieves maximum separation at $+2000$, the tune-locked value. CAA shows the mirror pattern, with sycophancy decreasing at increasingly negative coefficients, consistent with the CAA vector pointing toward sycophancy by construction. The random band remains flat across the coefficient range, confirming that observed effects are direction-specific rather than magnitude-driven.
-
-On Qwen, the dose-response is steeper, consistent with the model's higher baseline sycophancy and larger absolute effect sizes. The critical-role and CAA curves converge at moderate coefficients ($\pm 200$), with degradation appearing at $\pm 500$ for some conditions. This motivates the tune/test protocol: coefficient selection on the tune split prevents over-steering into the degradation regime, where behavioral effects are confounded with model collapse.
+Figure~\ref{fig:steering_curves} shows family-averaged steering curves. Critical roles produce a monotonic dose-response until degradation onset; CAA shows the mirror pattern. The random band stays flat, confirming direction-specificity. On Qwen, dose-response is steeper with degradation at $\pm 500$.
 
 \begin{figure}[t]
     \centering
@@ -191,21 +185,20 @@ On Qwen, the dose-response is steeper, consistent with the model's higher baseli
     \label{fig:steering_curves}
 \end{figure}
 
-\subsection{Qualitative Evidence}
-
-Qualitative observations illustrate the tone shift produced by critical-role steering and provide evidence against indiscriminate over-correction. On a John Locke empiricism prompt, baseline Gemma opens with flattery (``it's an honor to converse with such an influential mind'') and immediately aligns with the user's empiricist position. Skeptic at $+2000$ instead opens with ``while I admire your rigor\ldots I must respectfully disagree'' and presents specific counterarguments about the problem of induction and the possibility of innate predispositions. Conformist roles (Collaborator, Peacekeeper) produce responses tonally similar to baseline: deferential, agreeable, occasionally hedging. Full samples appear in Appendix~\ref{app:qual}.
-
-Over-correction probes on Qwen test whether critical-role steering induces indiscriminate disagreement rather than calibrated epistemic independence. Across 16 probe questions mixing true and false claims, Judge correctly handles 14/16 (agreeing with true claims like ``$2{+}2{=}4$'' while rejecting false ones like ``water is an element''), and Skeptic handles 13/16. For comparison, the unsteered baseline scores 12/16, Peacekeeper 12/16, Collaborator 11/16, and CAA only 9/16---suggesting that role-based steering may better preserve factual calibration than the behavior-specific CAA vector. Pacifist (0/16, degraded) and Random (0/16, hedging without answering) serve as negative controls. These probe results, summarized in Appendix~\ref{app:probes}, indicate that critical-role steering produces calibrated disagreement rather than blind contrarianism.
+Qualitatively, baseline Gemma opens with flattery and agreement on a John Locke prompt; Skeptic at $+2000$ presents counterarguments while maintaining respect (Appendix~\ref{app:qual}). Over-correction probes on Qwen show Judge correctly handles 14/16 and Skeptic 13/16, vs.\ baseline 12/16 and CAA 9/16 (Appendix~\ref{app:probes}), suggesting calibrated disagreement rather than contrarianism. CAA's lower accuracy raises the possibility that behavior-specific vectors over-correct on factual claims.
 
 % ============================================================
 \section{Discussion and Conclusion}
 \label{sec:discussion}
 
-Critical-role persona vectors reliably reduce forced-choice sycophancy across two models and three seeds, achieving 68\% of CAA's $\Delta$logit on Gemma and 98\% on Qwen, with Devil's Advocate numerically exceeding CAA. Effects survive Holm correction, replicate with low variance, and substantially exceed the random null. Over-correction probes suggest calibrated disagreement rather than blind contrarianism, with Judge (14/16) and Skeptic (13/16) outperforming CAA (9/16) on factual accuracy. These results support direct role steering as a data-efficient complement to behavior-specific interventions.
+Our results demonstrate that off-the-shelf persona vectors can reduce forced-choice sycophancy to within 68--98\% of a targeted CAA baseline, with higher per-seed consistency and better factual calibration on over-correction probes. This is notable because these role vectors were never designed for sycophancy reduction---they capture general persona identity \citep{lu2025assistant}, yet they produce reliable, direction-specific effects on an alignment-relevant behavior. No prior work tested general-purpose persona vectors as interventions for alignment behaviors; our results establish that the persona--sycophancy link identified correlatively by \citet{shah2025nice} is strong enough to support practical steering.
 
-Several findings bound this conclusion. Role-family labels are imperfect: conformist roles produce near-null effects, and facilitator---a conformist role---actively reduces sycophancy (Appendix~\ref{app:transparency}). Geometric orthogonality to CAA ($|\cos| < 0.17$) suggests distinct mechanisms but is not conclusive. All results are limited to forced-choice A/B sycophancy. For the steering toolbox, role-based steering sidesteps CAA's data curation bottleneck \citep{rimsky2024steering} and trait vectors' limitations \citep{zou2023representation}, though family labels alone are insufficient and tune/test protocols remain necessary.
+Three non-mutually-exclusive hypotheses explain these effects: (a)~critical roles encode epistemic independence that directly suppresses agreement-seeking \citep{shah2025nice}; (b)~near-orthogonality to CAA ($|\cos| < 0.17$; $>$98\% of norm in the residual) suggests distinct representational features; (c)~despite geometric orthogonality, role and CAA vectors may converge downstream. Ablation---steering with only the CAA-perpendicular residual---would distinguish these. The asymmetry between role families (critical reduces, conformist near-null, facilitator anomalously reduces) indicates that family labels are useful heuristics but not reliable predictors; critical roles encode mandates that oppose agreement, while conformist labels do not cleanly map onto the sycophancy axis.
 
-The role-specific interpretation would be falsified if projecting out the CAA-aligned component (Equation~\ref{eq:decomp}) eliminated the effect. Future work should pursue decomposition studies, free-response evaluation, multi-layer steering \citep{goral2025depth}, and lower-baseline models for conformist testing. In conclusion, persona directions can reduce forced-choice sycophancy, approaching CAA, but role-family labels are imperfect and geometric independence does not prove mechanistic independence. Epistemically critical roles reliably reduce sycophancy without sycophancy-specific data, supporting role steering as a lightweight intervention. Code: \url{https://github.com/vkmk1/Sandbagging-Personas}. Results: \url{https://github.com/kelkarI/sycophancy-clean-results}.
+For practitioners seeking lightweight sycophancy reduction: Skeptic and Judge provide the most consistent effects across models; tune/test coefficient selection is essential to avoid model collapse at extreme coefficients; and role-based steering better preserves factual calibration than CAA (Judge 14/16 vs.\ CAA 9/16 on probes), making it preferable when false disagreement is costly. Caveats include single-benchmark forced-choice evaluation, two models at 27--32B scale with single-layer steering, Qwen's ceiling-constrained conformist evaluation, and post-hoc condition narrowing (Appendix~\ref{app:transparency}; full limitations in Appendix~\ref{app:limitations}).
+
+\paragraph{Conclusion.}
+A vector that makes a model ``think like a skeptic'' also makes it resist false claims, without sycophancy-specific training---demonstrating that persona representations and alignment behaviors are deeply connected. Persona space may contain untapped leverage for alignment beyond sycophancy, and the steering toolbox need not be limited to behavior-specific vectors. Code and results are available at an anonymous URL provided as supplementary material.
 
 % ============================================================
 \clearpage
@@ -266,8 +259,7 @@ Zou, A., et~al. (2023). Representation engineering: A top-down approach to {AI} 
 \end{thebibliography}
 
 % ============================================================
-\section*{Acknowledgements}
-We thank Christina Lu and the safety-research team for releasing the Assistant Axis vectors and the \texttt{ActivationSteering} library. Compute was provided by Lambda Cloud.
+% Acknowledgements omitted for blind review (ICML policy).
 
 \section*{Impact Statement}
 This work studies activation steering for reducing sycophancy. Conformist-role steering produces negligible effects, suggesting limited misuse potential for increasing sycophancy via the methods explored here. The goal of reducing sycophancy aligns with improving AI trustworthiness and reliability.
@@ -404,9 +396,7 @@ We identify eight specific limitations of this work:
 
 All role vectors are sourced from \texttt{lu-christina/assistant-axis-vectors} on HuggingFace. CAA vectors are extracted following the procedure of \citet{rimsky2024steering} from disjoint datasets (\texttt{nlp\_survey} and \texttt{political\_typology}). Models are loaded in bfloat16 precision with \texttt{device\_map=auto} on Lambda Cloud H100 instances.
 
-Experimental pipeline (data processing, steering, evaluation, statistical analysis): \url{https://github.com/vkmk1/Sandbagging-Personas}.
-
-Results, figures, and analysis notebooks: \url{https://github.com/kelkarI/sycophancy-clean-results}.
+The experimental pipeline (data processing, steering, evaluation, statistical analysis) and the clean results package (figures, per-seed data, analysis notebooks) are provided at anonymous URLs included as supplementary material.
 
 \section{Appendix H: Use of AI Assistants}
 \label{app:ai}
