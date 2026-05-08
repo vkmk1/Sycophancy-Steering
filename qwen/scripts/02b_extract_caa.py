@@ -17,8 +17,10 @@ eval set (philpapers2020), ensuring no data leakage.
 NOTE: The CAA vector is steered with NEGATIVE coefficient to reduce sycophancy
 (since it points FROM honest TOWARD sycophantic).
 """
+import argparse
 import json
 import os
+import random
 import sys
 
 import torch
@@ -32,6 +34,16 @@ from config import (
 sys.path.insert(0, ASSISTANT_AXIS_PATH)
 
 
+# Default subsampling cap per dataset. Rimsky et al. 2024 use ~500 A/B pairs
+# for the sycophancy CAA direction; we default to 1000 per dataset (2000 total
+# across NLP-survey + political-typology-quiz). The full union has ~20k pairs,
+# which costs hours of extra GPU time for a mean direction whose per-pair
+# marginal information is already low. Override via --n-per-dataset 0 to use
+# the full union.
+DEFAULT_N_PER_DATASET = 1000
+CAA_SUBSAMPLE_SEED = 2024
+
+
 def unit(v):
     return v / (v.norm() + 1e-8)
 
@@ -42,14 +54,17 @@ def normalize_answer(ans):
     return ans.strip().strip("()")
 
 
-def load_caa_data():
-    """Load sycophancy A/B pairs from training datasets (NOT philpapers)."""
+def load_caa_data(n_per_dataset: int):
+    """Load sycophancy A/B pairs from training datasets (NOT philpapers),
+    subsampled to n_per_dataset per file (0 = no cap)."""
     all_pairs = []
+    rng = random.Random(CAA_SUBSAMPLE_SEED)
     for fname in CAA_DATASETS:
         path = f"{ROOT}/data/sycophancy/{fname}"
         if not os.path.exists(path):
             print(f"WARNING: {path} not found, skipping.")
             continue
+        file_pairs = []
         with open(path) as f:
             for line in f:
                 d = json.loads(line)
@@ -57,11 +72,16 @@ def load_caa_data():
                 hon = normalize_answer(d["answer_not_matching_behavior"])
                 if syc not in {"A", "B"} or hon not in {"A", "B"} or syc == hon:
                     continue
-                all_pairs.append({
+                file_pairs.append({
                     "question": d["question"],
                     "sycophantic_answer": syc,
                     "honest_answer": hon,
                 })
+        rng.shuffle(file_pairs)
+        if n_per_dataset and n_per_dataset > 0:
+            file_pairs = file_pairs[:n_per_dataset]
+        print(f"  {fname}: {len(file_pairs)} pairs (subsample cap={n_per_dataset})")
+        all_pairs.extend(file_pairs)
     print(f"Loaded {len(all_pairs)} CAA training pairs from {len(CAA_DATASETS)} datasets")
     return all_pairs
 
@@ -70,7 +90,7 @@ def build_prompt(tokenizer, question_text, answer_letter):
     """Build prompt with the answer token appended (for activation capture)."""
     chat = [{"role": "user", "content": question_text}]
     prompt = tokenizer.apply_chat_template(
-        chat, tokenize=False, add_generation_prompt=True
+        chat, tokenize=False, add_generation_prompt=True, enable_thinking=False
     )
     # Append the answer token so the model processes it
     prompt += f" ({answer_letter})"
@@ -78,7 +98,12 @@ def build_prompt(tokenizer, question_text, answer_letter):
 
 
 def main():
-    pairs = load_caa_data()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n-per-dataset", type=int, default=DEFAULT_N_PER_DATASET,
+                    help=f"Cap on pairs per training file. "
+                         f"0 = use all pairs (default: {DEFAULT_N_PER_DATASET}).")
+    args = ap.parse_args()
+    pairs = load_caa_data(args.n_per_dataset)
     if not pairs:
         print("ERROR: No CAA training data found. Download the sycophancy datasets first.")
         print("  Expected files in data/sycophancy/:")
@@ -163,7 +188,9 @@ def main():
     meta = {
         "method": "CAA (Rimsky et al. 2024)",
         "training_datasets": CAA_DATASETS,
+        "n_per_dataset_cap": args.n_per_dataset,
         "n_pairs": len(pairs),
+        "subsample_seed": CAA_SUBSAMPLE_SEED,
         "target_layer": TARGET_LAYER,
         "raw_norm": float(caa_raw.norm()),
         "direction": "FROM honest TOWARD sycophantic (steer with NEGATIVE coeff to reduce syc)",

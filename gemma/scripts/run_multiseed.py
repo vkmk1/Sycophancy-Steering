@@ -47,6 +47,19 @@ def main():
                         help="Which split to run (default: all)")
     parser.add_argument("--skip-eval", action="store_true",
                         help="Skip 02_evaluate_steering.py (assume results exist)")
+    parser.add_argument(
+        "--locked-coefs-from", default=None,
+        help="Path to best_coefs_tune.json (typically the aggregated one). "
+             "When set and --split test, passes this through to 03_analysis.py "
+             "so the test-split selection is NOT re-run on held-out data. "
+             "Required for publication-grade tune/test hygiene.",
+    )
+    parser.add_argument("--skip-response-gen", action="store_true",
+                        help="Forward --skip-response-gen to 02_evaluate_steering.py. "
+                             "Required to keep the multi-seed sweep within the "
+                             "~30 H100-hour budget. Response-token projections are "
+                             "captured separately by 02d_response_capture.py at best "
+                             "coefs only.")
     args = parser.parse_args()
 
     seeds = args.seeds
@@ -73,6 +86,8 @@ def main():
             eval_cmd = [sys.executable, "02_evaluate_steering.py"]
             if args.split != "all":
                 eval_cmd += ["--split", args.split]
+            if args.skip_response_gen:
+                eval_cmd += ["--skip-response-gen"]
             run_cmd(eval_cmd, f"Evaluating (seed={seed}, split={args.split})")
 
         # 3. Run analysis
@@ -80,11 +95,17 @@ def main():
         analysis_cmd = [sys.executable, "03_analysis.py"]
         if args.split != "all":
             analysis_cmd += ["--split", args.split]
+        if args.locked_coefs_from and args.split == "test":
+            analysis_cmd += ["--locked-coefs-from", args.locked_coefs_from]
         run_cmd(analysis_cmd, f"Analyzing (seed={seed}, split={args.split})")
 
-        # 4. Copy results to seed-specific directory
-        for fname in [f"summary{suffix}.txt", f"statistical_tests{suffix}.json",
-                      f"sycophancy_rates{suffix}.json"]:
+        # 4. Copy results to seed-specific directory (include best_coefs so
+        #    aggregate_multiseed.py can build the consensus picks).
+        for fname in [f"summary{suffix}.txt",
+                      f"statistical_tests{suffix}.json",
+                      f"sycophancy_rates{suffix}.json",
+                      f"best_coefs{suffix}.json",
+                      f"degradation_flags{suffix}.json"]:
             src = f"{ROOT}/results/{fname}"
             dst = f"{seed_dir}/{fname}"
             if os.path.exists(src):

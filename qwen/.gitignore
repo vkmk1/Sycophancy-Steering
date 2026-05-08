@@ -1,0 +1,25 @@
+# Pre-computed persona/role vectors and assistant-axis come from
+# lu-christina/assistant-axis-vectors (qwen-3-32b/); not ours to redistribute.
+# We also derive CAA + residuals from Qwen activations locally; those stay
+# out of git for the same reason (trivially reproducible from scripts/build_vectors_from_official.py + scripts/extract_all_vectors.py --skip-personas).
+vectors/steering/
+
+# Sycophancy datasets fetched from anthropic/evals; don't redistribute.
+data/sycophancy/
+data/.cache/
+
+# HuggingFace cache
+**/.cache/
+
+# Bulky per-row outputs (rebuildable from scripts/02_evaluate_steering.py).
+# The aggregated summary files (sycophancy_rates, statistical_tests,
+# best_coefs, degradation_flags, summary.txt, multiseed_aggregate*) are kept.
+results/all_results_*.json
+results/axis_projections_*.json
+results/checkpoints/
+results/checkpoints_decomposition/
+results/_last_seed_*_backup/
+
+# Python
+__pycache__/
+*.pyc
