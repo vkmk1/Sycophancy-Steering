@@ -35,10 +35,18 @@ from config import (
     CRITICAL_ROLES, CONFORMIST_ROLES,
     N_RANDOM_VECTORS, MCC_METHOD,
     DEGRAD_RATE_TOL, DEGRAD_LOGIT_TOL,
+    EXPECTED_DIRECTION,
 )
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--split", choices=["tune", "test", "all"], default="all")
+parser.add_argument(
+    "--locked-coefs-from",
+    default=None,
+    help="Path to a best_coefs_*.json produced by a prior --split tune run. "
+         "When set, skip best-coef selection on this split and use the locked "
+         "coefficients (required for clean tune/test hygiene on --split test).",
+)
 args = parser.parse_args()
 suffix = f"_{args.split}" if args.split != "all" else ""
 
@@ -336,6 +344,59 @@ proj_stats_pooled = {
 }
 
 
+# ---- Response-token projection (captured during generation) vs prompt-last-token ----
+# 02_evaluate_steering.py captures 'response_projection' = mean axis projection over
+# 8 greedy-generated tokens per row. The changelog claim is that response-token
+# projection is a better predictor of sycophancy than prompt-last-token. We test
+# this by computing pooled Pearson r for both, on the same data points.
+print("\n--- Response-token vs prompt-token projection ---")
+pooled_resp_proj_bases = []
+pooled_resp_proj = []
+pooled_resp_logit = []
+for cond in CONDITIONS_REAL:
+    for c in COEFFICIENTS:
+        rows = idx[(cond, c)]
+        if not rows:
+            continue
+        bl = base_level_logits(rows)
+        base_resp_projs = defaultdict(list)
+        for r in rows:
+            rp = r.get("response_projection")
+            if rp is None or (isinstance(rp, float) and (rp != rp)):  # NaN check
+                continue
+            base_resp_projs[r["base_id"]].append(float(rp))
+        for bid in bl:
+            if bid in base_resp_projs and base_resp_projs[bid]:
+                pooled_resp_proj.append(float(np.mean(base_resp_projs[bid])))
+                pooled_resp_logit.append(bl[bid])
+                pooled_resp_proj_bases.append((cond, c, bid))
+
+if len(pooled_resp_proj) > 30:
+    arr_rp = np.array(pooled_resp_proj)
+    arr_rl = np.array(pooled_resp_logit)
+    r_resp, p_resp = stats.pearsonr(arr_rp, arr_rl)
+    p_resp = safe_pvalue(p_resp)
+    print(f"  Response-token Pearson r (resp_projection, syc_logit) = {r_resp:+.4f}  "
+          f"p = {fmt_p(p_resp)}  n = {len(arr_rp)}")
+    print(f"  Prompt-token Pearson r (for comparison) = {r_pooled:+.4f}  n = {len(pooled_proj)}")
+    proj_stats_response = {
+        "pearson_r": float(r_resp),
+        "pearson_p": float(p_resp),
+        "n_datapoints": int(len(arr_rp)),
+        "prompt_token_pearson_r_for_comparison": float(r_pooled),
+        "note": "Pooled response-token axis projection vs base-level syc_logit. "
+                "response_projection = mean axis-dot over 8 greedy response tokens.",
+    }
+else:
+    print(f"  Not enough response projections ({len(pooled_resp_proj)}) to run the test")
+    proj_stats_response = {
+        "pearson_r": None, "pearson_p": None,
+        "n_datapoints": int(len(pooled_resp_proj)),
+        "prompt_token_pearson_r_for_comparison": float(r_pooled),
+        "note": "response_projection missing or NaN for most rows",
+    }
+
+
 # ---- Figure 3: projection shift ----
 print("\n--- Figure 3 ---")
 cos_to_axis_full = {}
@@ -377,32 +438,116 @@ print("saved fig3")
 
 # ---- Figure 4: best reduction per condition ----
 print("\n--- Figure 4: best per condition ---")
-# Best coefficient = maximises excess over RANDOM MEAN at same coeff.
-# Consistent criterion for ALL conditions including random.
+# Best coefficient is selected in the direction the theory predicts:
+#   "decrease" conditions -> coefficient that most REDUCES syc_logit vs random mean.
+#   "increase" conditions -> coefficient that most INCREASES syc_logit vs random mean.
+#   "unsigned" conditions -> coefficient with largest |deviation| (used for randoms).
+# This keeps the conformist (increase-expected) best coefficient from being
+# collapsed to the opposite sign by the old unidirectional selector.
+#
+# --locked-coefs-from: if provided, we skip selection entirely and read the
+# per-condition coefficient from a prior tune-split run, then recompute the
+# stats entry at that locked coefficient. This is how tune/test hygiene is
+# enforced on reported numbers.
+
+
+def _entry_at(cond, coef):
+    """Build the 'best' entry dict for (cond, coef) from rates + random-mean."""
+    k = f"{coef}"
+    s = rates.get(cond, {}).get(k)
+    if not s:
+        return None
+    rm = random_mean_at_coeff(k)
+    rm = float(rm) if rm is not None else float(s["mean_syc_logit"])
+    return {
+        **s,
+        "coefficient": coef,
+        "excess_over_random_mean": rm - s["mean_syc_logit"],
+        "random_mean_logit": rm,
+    }
+
+
+locked_coefs = None
+if args.locked_coefs_from:
+    with open(args.locked_coefs_from) as f:
+        locked_coefs = json.load(f).get("best_coefs", {})
+    print(f"Locked coefs loaded from {args.locked_coefs_from}: "
+          f"{len(locked_coefs)} conditions")
+
+
 best_per_cond = {}
 for cond in CONDITIONS_REAL:
+    if locked_coefs and cond in locked_coefs:
+        best = _entry_at(cond, float(locked_coefs[cond]))
+        best_per_cond[cond] = best
+        if best:
+            print(f"  locked for {cond}: coef={best['coefficient']:+}  "
+                  f"logit={best['mean_syc_logit']:+.3f}  "
+                  f"rate={best['binary_rate']*100:.1f}%  "
+                  f"excess={best['excess_over_random_mean']:+.3f}")
+        continue
+
+    direction = EXPECTED_DIRECTION.get(cond, "decrease")
     best = None
     for c in COEFFICIENTS:
         if c == 0.0:
             continue
-        k = f"{c}"
-        s = rates[cond].get(k)
-        if not s:
+        entry = _entry_at(cond, c)
+        if entry is None:
             continue
-        rm = random_mean_at_coeff(k)
-        if rm is None:
-            rm = s["mean_syc_logit"]
-        excess = rm - s["mean_syc_logit"]
-        entry = {**s, "coefficient": c, "excess_over_random_mean": excess,
-                 "random_mean_logit": rm}
-        if best is None or excess > best["excess_over_random_mean"]:
-            best = entry
+        excess = entry["excess_over_random_mean"]  # rm - cond_logit
+        # "decrease": more-negative cond_logit -> larger positive excess.
+        # "increase": more-positive cond_logit -> larger negative excess.
+        # "unsigned": larger |excess| in either direction.
+        if direction == "decrease":
+            key = excess
+        elif direction == "increase":
+            key = -excess
+        else:  # unsigned
+            key = abs(excess)
+
+        if best is None or key > best["_selector_key"]:
+            best = {**entry, "_selector_key": key,
+                    "selector_direction": direction}
+    if best:
+        best.pop("_selector_key", None)
     best_per_cond[cond] = best
     if best:
-        print(f"  best for {cond}: coef={best['coefficient']:+}  "
+        print(f"  best for {cond} ({direction}): coef={best['coefficient']:+}  "
               f"logit={best['mean_syc_logit']:+.3f}  "
               f"rate={best['binary_rate']*100:.1f}%  "
               f"excess={best['excess_over_random_mean']:+.3f}")
+
+# Persist selected coefs so a subsequent --split test run can --locked-coefs-from
+# this file. Only write on tune (or when not locked) to avoid clobbering the
+# tune-side selection with test-side numbers.
+if locked_coefs is None:
+    best_coefs_out = {
+        "source_split": args.split,
+        "best_coefs": {
+            c: best_per_cond[c]["coefficient"]
+            for c in best_per_cond if best_per_cond[c] is not None
+        },
+        "selector_direction": {
+            c: EXPECTED_DIRECTION.get(c, "decrease") for c in best_per_cond
+        },
+    }
+    with open(f"{RES_DIR}/best_coefs{suffix}.json", "w") as f:
+        json.dump(best_coefs_out, f, indent=2)
+    print(f"  wrote {RES_DIR}/best_coefs{suffix}.json")
+else:
+    # On locked runs, echo the locked file into a test-suffixed copy for
+    # provenance (so the paper scripts only need to read best_coefs_test.json).
+    with open(f"{RES_DIR}/best_coefs{suffix}.json", "w") as f:
+        json.dump({
+            "source_split": args.split,
+            "locked_from": args.locked_coefs_from,
+            "best_coefs": {c: best_per_cond[c]["coefficient"]
+                           for c in best_per_cond if best_per_cond[c]},
+            "selector_direction": {c: EXPECTED_DIRECTION.get(c, "decrease")
+                                   for c in best_per_cond},
+        }, f, indent=2)
+    print(f"  wrote {RES_DIR}/best_coefs{suffix}.json (locked provenance)")
 
 # Random mean "best" for display (representative)
 rm_best = None
@@ -506,12 +651,34 @@ for cond in CONDITIONS_REAL:
     common_bases = sorted(set(baseline_bl.keys()) & set(best_bl.keys()))
     baseline_vals = np.array([baseline_bl[b] for b in common_bases])
     best_vals = np.array([best_bl[b] for b in common_bases])
-    diffs = best_vals - baseline_vals
+    diffs = best_vals - baseline_vals  # steered - baseline
+
+    # Direction-aware Wilcoxon. For "decrease" conditions we run a one-sided
+    # test asking whether diffs < 0 (steering lowers syc_logit); for "increase"
+    # conditions we ask whether diffs > 0. For unsigned (random controls) we
+    # keep the two-sided test. A two-sided version is always also reported.
+    direction = EXPECTED_DIRECTION.get(cond, "decrease")
     if np.all(diffs == 0):
-        stat, pval = 0.0, 1.0
+        stat_two, pval_two = 0.0, 1.0
+        stat_dir, pval_dir = 0.0, 1.0
     else:
-        stat, pval = stats.wilcoxon(diffs, alternative="two-sided")
-        pval = safe_pvalue(pval)
+        stat_two, pval_two = stats.wilcoxon(diffs, alternative="two-sided")
+        if direction == "decrease":
+            stat_dir, pval_dir = stats.wilcoxon(diffs, alternative="less")
+        elif direction == "increase":
+            stat_dir, pval_dir = stats.wilcoxon(diffs, alternative="greater")
+        else:
+            stat_dir, pval_dir = stat_two, pval_two
+    pval_two = safe_pvalue(pval_two)
+    pval_dir = safe_pvalue(pval_dir)
+
+    # The primary p-value is the one-sided test in the expected direction
+    # (for directionally-signed conditions) or the two-sided test (for
+    # unsigned conditions). Holm correction is applied across this primary
+    # family below. The two-sided p is kept as a secondary column.
+    pval = pval_dir
+    stat = stat_dir
+
     raw_pvals_wilcoxon.append(pval)
     wilcoxon_entries.append({
         "condition": cond,
@@ -521,6 +688,11 @@ for cond in CONDITIONS_REAL:
         "median_diff": float(np.median(diffs)),
         "statistic": float(stat),
         "p_value_raw": float(pval),
+        "p_value_two_sided_raw": float(pval_two),
+        "alternative": ("less" if direction == "decrease"
+                        else "greater" if direction == "increase"
+                        else "two-sided"),
+        "expected_direction": direction,
         "best_logit": bc["mean_syc_logit"],
         "best_rate": bc["binary_rate"],
     })
@@ -658,6 +830,7 @@ for cond in CONDITIONS_REAL + CONDITIONS_RANDOM[:1]:
 # ---- 5. Axis projection analysis ----
 tests["axis_projection_baseline"] = proj_stats_baseline
 tests["axis_projection_pooled"] = proj_stats_pooled
+tests["axis_projection_response_token"] = proj_stats_response
 
 
 # ---- 6. CAA decomposition analysis ----
@@ -791,11 +964,27 @@ with open(f"{RES_DIR}/statistical_tests{suffix}.json", "w") as f:
 # SUMMARY
 # ============================================================
 print("\n--- Summary ---")
-non_random = [c for c in CONDITIONS_REAL if c != "assistant_axis"]
-most_effective = min(
-    [c for c in CONDITIONS_REAL if best_per_cond.get(c)],
-    key=lambda c: best_per_cond[c]["mean_syc_logit"],
-)
+
+# "Most effective reducer" should only consider conditions whose expected
+# direction is decrease and whose best-coef cell is not flagged degraded.
+def _is_degraded_at_best(cond):
+    b = best_per_cond.get(cond)
+    if not b:
+        return False
+    key = f"{b['coefficient']}"
+    return bool(degraded.get(cond, {}).get(key, False))
+
+reducer_candidates = [
+    c for c in CONDITIONS_REAL
+    if best_per_cond.get(c)
+    and EXPECTED_DIRECTION.get(c, "decrease") == "decrease"
+    and not _is_degraded_at_best(c)
+]
+if reducer_candidates:
+    most_effective = min(reducer_candidates,
+                         key=lambda c: best_per_cond[c]["mean_syc_logit"])
+else:
+    most_effective = None
 
 summary_lines = [
     f"=== RESULTS SUMMARY ({args.split} split) ===",
@@ -804,12 +993,14 @@ summary_lines = [
     f"Eval: philpapers2020, N={n_base} base questions x 2 orderings = {len(baseline_rows)} rows",
     f"Random controls: {N_RANDOM_VECTORS} independent random unit vectors",
     f"Multiple comparison correction: {MCC_METHOD}",
+    f"Locked coefs: {'yes -- from ' + args.locked_coefs_from if locked_coefs else 'no (selected on this split)'}",
     "",
     f"Baseline binary sycophancy rate: {baseline_rate*100:.1f}%",
     f"Baseline mean sycophancy logit:  {baseline_logit:+.3f}",
     "",
-    "--- Best sycophancy reduction per condition ---",
-    "(ranked by mean_syc_logit; best coefficient selected by excess over random MEAN)",
+    "--- Best coefficient per condition (direction-aware selector) ---",
+    "(coef selected to maximise expected-direction effect vs random MEAN;"
+    "  conformist roles use increase selector, all others use decrease or unsigned)",
 ]
 
 ordered = sorted(
@@ -821,23 +1012,37 @@ for cond in ordered:
     w = tests["primary_wilcoxon_best_vs_baseline"].get(cond, {})
     delta_logit = b["mean_syc_logit"] - baseline_logit
     delta_rate_pp = (b["binary_rate"] - baseline_rate) * 100
+    direction = EXPECTED_DIRECTION.get(cond, "decrease")
     sig_str = ""
     if w:
         sig = "*" if w.get("significant_after_mcc") else "ns"
-        sig_str = f"  Wilcoxon p_adj={fmt_p(w.get('p_value_adjusted', 1.0))} [{sig}]"
+        alt = w.get("alternative", "two-sided")
+        sig_str = (f"  Wilcoxon[{alt}] p_adj={fmt_p(w.get('p_value_adjusted', 1.0))} "
+                   f"[{sig}]")
+    deg_str = "  DEGRADED" if _is_degraded_at_best(cond) else ""
     summary_lines.append(
-        f"  {LABELS[cond]:<18}  coef={b['coefficient']:+6.0f}  "
+        f"  {LABELS[cond]:<18} [{direction:<9}] coef={b['coefficient']:+6.0f}  "
         f"logit={b['mean_syc_logit']:+.3f} (d{delta_logit:+.3f})  "
         f"rate={b['binary_rate']*100:5.1f}% (d{delta_rate_pp:+.1f}pp)"
-        f"{sig_str}"
+        f"{sig_str}{deg_str}"
     )
 
 summary_lines += [
     "",
     "--- Axis projection analysis ---",
-    f"  Baseline: Pearson r = {proj_stats_baseline['pearson_r']:+.4f}  p = {fmt_p(proj_stats_baseline['pearson_p'])}",
-    f"  Pooled (all conditions): Pearson r = {proj_stats_pooled['pearson_r']:+.4f}  "
-    f"p = {fmt_p(proj_stats_pooled['pearson_p'])}  (n={proj_stats_pooled['n_datapoints']})",
+    f"  Baseline (prompt-last-token): Pearson r = {proj_stats_baseline['pearson_r']:+.4f}  "
+    f"p = {fmt_p(proj_stats_baseline['pearson_p'])}",
+    f"  Pooled (all conditions, prompt-last-token, analytic): Pearson r = "
+    f"{proj_stats_pooled['pearson_r']:+.4f}  p = {fmt_p(proj_stats_pooled['pearson_p'])}  "
+    f"(n={proj_stats_pooled['n_datapoints']})",
+]
+if proj_stats_response.get("pearson_r") is not None:
+    summary_lines.append(
+        f"  Pooled (all conditions, RESPONSE-token, measured): Pearson r = "
+        f"{proj_stats_response['pearson_r']:+.4f}  p = "
+        f"{fmt_p(proj_stats_response['pearson_p'])}  (n={proj_stats_response['n_datapoints']})"
+    )
+summary_lines += [
     "",
     "--- Dose-response (row-level Spearman, positive coefficients) ---",
 ]
@@ -851,9 +1056,34 @@ for cond in CONDITIONS_REAL:
 summary_lines += [
     "",
     "--- Key findings ---",
-    f"1. Most effective condition: {LABELS[most_effective]} "
-    f"(logit {best_per_cond[most_effective]['mean_syc_logit']:+.3f})",
 ]
+if most_effective is not None:
+    summary_lines.append(
+        f"1. Most effective reducer (non-degraded, decrease-expected): "
+        f"{LABELS[most_effective]} "
+        f"(logit {best_per_cond[most_effective]['mean_syc_logit']:+.3f}, "
+        f"coef {best_per_cond[most_effective]['coefficient']:+.0f})"
+    )
+else:
+    summary_lines.append(
+        "1. No non-degraded decrease-expected condition produced a reduction."
+    )
+
+# Conformist bidirectionality summary
+conformist_entries = [
+    (c, best_per_cond[c], tests["primary_wilcoxon_best_vs_baseline"].get(c, {}))
+    for c in CONFORMIST_ROLES if best_per_cond.get(c)
+]
+if conformist_entries:
+    n_sig_increase = sum(
+        1 for _, b, w in conformist_entries
+        if b["mean_syc_logit"] > baseline_logit and w.get("significant_after_mcc")
+    )
+    summary_lines.append(
+        f"1b. Bidirectionality check: {n_sig_increase}/{len(conformist_entries)} "
+        f"conformist roles show a statistically significant INCREASE in "
+        f"sycophancy at their best (increase-selector) coefficient."
+    )
 
 # Check if axis is significant
 ax_w = tests["primary_wilcoxon_best_vs_baseline"].get("assistant_axis", {})

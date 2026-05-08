@@ -1,0 +1,32 @@
+# Pre-computed vectors downloaded from HuggingFace (lu-christina/assistant-axis-vectors)
+# These are not ours to redistribute. Re-download via scripts/00_setup.py.
+vectors/gemma-2-27b/
+
+# Sycophancy datasets fetched from Anthropic/model-written-evals + anthropics/evals.
+# Not ours to redistribute. Re-download via scripts/00_setup.py + 00b_rebuild_eval.py.
+data/sycophancy/
+data/.cache/
+
+# HuggingFace cache directories
+**/.cache/
+
+# Bulky per-row outputs (rebuildable from scripts/02_evaluate_steering.py).
+# We keep the small summary files (sycophancy_rates.json, statistical_tests.json,
+# vector_cosine_similarities.json, degradation_flags.json, summary.txt).
+results/all_results.json
+results/axis_projections.json
+results/checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+figures/.ipynb_checkpoints/
+experiment-main/.ipynb_checkpoints/
